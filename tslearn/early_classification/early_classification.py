@@ -16,7 +16,63 @@ import torch
 import numpy as np
 
 class EARLIEST(torch.nn.Module, TimeSeriesBaseEstimator):
-    # Author: Tom Hartvigsen (twhartvigsen@wpi.edu)
+    """Early Classification of multivariate time series using the model presented in [1].
+    All parameters are set to reasonable values. The most important parameters to tune,
+    in order, are lam, learning_rate, and nhid. This code should be plenty fast for
+    training without GPU, but as series get longer, GPU will become more beneficial.
+    
+    Parameters
+    ----------
+    ninp : int
+        Number of input variables. For example, if we record Heart Rate and Blood
+        Pressure for 1 patient over time, this creates a 2-variable time series,
+        regardless of the number of timesteps.
+
+    nclasses : int
+        Number of output classes.
+
+    lam : float
+        Earliness weight. Higher values encourages earlier predictions, lower values
+        indicate less emphasis on earliness.
+
+    nhid : int
+        Number of dimensions in RNN's hidden state.
+
+    nlayers : int
+        Number of layers in the RNN.
+
+    learning_rate: float
+        Learning rate with which to train EARLIEST.
+
+    nepochs : int
+        Number of epoch to train EARLIEST for.
+
+    batch_size : int
+        Batch size with which to train EARLIEST. Larger batch size trains faster
+
+
+    Examples
+    --------
+    >>> N = 10 # Number of time series
+    >>> T = 5 # Number of time steps per series
+    >>> V = 2 # Number of variables per series
+    >>> X_train = torch.rand((N, T, V)) # Create a dataset with 10 time series, each having 5 timesteps and 2 variables
+    >>> y_train = torch.randint(2, (N,)) # 10 random binary labels
+    >>> model = EARLIEST(ninp=V, nclasses=2, lam=1.0) # lam=1.0 indicates strong preference for earliness
+    >>> model.fit(X_train, y_train) # train EARLIEST on X_train
+    >>> X_test = torch.rand((5, T, V)) # create 5 random testing series
+    >>> preds, pred_times = model.predict_class_and_earliness(X_test)
+    >>> preds
+    array([1, 1, 0, 1, 0])
+    >>> pred_times
+    array([1, 1, 2, 1, 1])
+
+    References
+    ----------
+    [1] T. Hartvigsen, C. Sen, X. Kong, E. Rundensteiner.
+    Adaptive-Halting Policy Network for Early Classification.
+    KDD 2019.
+    """
     def __init__(self, ninp, nclasses, lam=0.01, nhid=50, nlayers=1, learning_rate=1e-2, nepochs=10, batch_size=16):
         super(EARLIEST, self).__init__()
 
@@ -128,7 +184,7 @@ class EARLIEST(torch.nn.Module, TimeSeriesBaseEstimator):
         # Given input time series, predict their class labels and their halting times assuming EARLIEST has already been trained
         logits, pred_times = self.forward(X_test, epsilon=0)
         preds = torch.max(torch.softmax(logits, dim=1), dim=1)[1]
-        return preds, pred_times
+        return preds.numpy(), pred_times.numpy()
 
     def init_hidden(self, bsz):
         """Initialize hidden states"""
@@ -191,7 +247,7 @@ class EARLIEST(torch.nn.Module, TimeSeriesBaseEstimator):
         self.grad_mask = torch.zeros_like(self.actions)
         for b in range(B):
             self.grad_mask[b, :(1 + halt_points[b, 0]).long()] = 1
-        return logits.squeeze(), (1+halt_points)/(T)
+        return logits.squeeze(), (1+halt_points)
 
     def compute_loss(self, logits, y):
         # --- compute reward ---
