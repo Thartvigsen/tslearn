@@ -194,7 +194,7 @@ class EARLIEST(torch.nn.Module, TimeSeriesBaseEstimator):
                 torch.zeros(self.nlayers, bsz, self.nhid))
         
     def forward(self, X, epsilon):
-        """Compute halting points and predictions"""
+        # Compute halting points and predictions
         X = torch.transpose(X, 0, 1)
         T, B, V = X.shape # Assume input is of shape (TIMESTEPS x BATCH x VARIABLES)
         baselines = [] # Predicted baselines
