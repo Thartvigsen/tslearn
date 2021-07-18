@@ -20,6 +20,8 @@ class EARLIEST(torch.nn.Module, TimeSeriesBaseEstimator):
     All parameters are set to reasonable values. The most important parameters to tune,
     in order, are lam, learning_rate, and nhid. This code should be plenty fast for
     training without GPU, but as series get longer, GPU will become more beneficial.
+
+    Code added by Tom Hartvigsen (twhartvigsen@wpi.edu)
     
     Parameters
     ----------
