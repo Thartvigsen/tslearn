@@ -12,6 +12,208 @@ from ..neighbors import KNeighborsTimeSeriesClassifier
 from ..clustering import TimeSeriesKMeans
 from ..bases import TimeSeriesBaseEstimator
 
+import torch
+import numpy as np
+
+class EARLIEST(torch.nn.Module, TimeSeriesBaseEstimator):
+    # Author: Tom Hartvigsen (twhartvigsen@wpi.edu)
+    def __init__(self, ninp, nclasses, lam=0.01, nhid=50, nlayers=1, learning_rate=1e-2, nepochs=10, batch_size=16):
+        super(EARLIEST, self).__init__()
+
+        # --- Hyperparameters ---
+        ninp = ninp # Number of variables
+        self.nclasses = nclasses # Number of classes
+        self.lam = lam # Parameter determining focus on Earliness vs. Accuracy (lam=0 means no interest in earliness, lam=1 mean strong interest in earliness)
+        self.nhid = nhid # Number of hidden states in the RNN
+        self.nlayers = nlayers # Number of layers in the RNN
+        self.learning_rate = learning_rate # Leraning rate for training EARLIEST
+        self.nepochs = nepochs # How many epochs to train EARLIEST for
+        self.batch_size = batch_size # Batch size to use while training EARLIEST (bigger batches mean faster training but less precise weight updates)
+
+        # --- Sub-networks ---
+        self.controller_linear = torch.nn.Linear(self.nhid+1, 1) # Initialize neural network for deciding whether or not to stop
+        self.baseline_linear = torch.nn.Linear(self.nhid+1, 1) # Initialize neural network to predict the "baseline", used to reduce variance in the REINFORCE algorithm
+        self.RNN = torch.nn.LSTM(ninp, self.nhid) # Initialize the core RNN in EARLIEST that models time series
+        self.classify = torch.nn.Linear(self.nhid, self.nclasses) # Initialize neural network for predicting the final class of a given time series
+        
+        self.exponentials = self.exponential_decay(nepochs)
+        
+    def exponential_decay(self, N):
+        # Commpute an exponential decay function
+        tau = 1
+        tmax = 4
+        t = np.linspace(0, tmax, N)
+        y = np.exp(-t/tau)
+        y = torch.FloatTensor(y)
+        return y/10.
+
+    def controller(self, x, epsilon):
+        # Run the controller
+        # input is the concatenated hidden state and current timestep
+        # output is 1. the decision whether or not to halt (1 = halt, 0 = wait) 2. log probability of chosen action 3. negative log likelihood of halting
+        probs = torch.sigmoid(self.controller_linear(x))
+        probs = (1-epsilon)*probs + epsilon*torch.tensor([0.05])  # Explore/exploit
+        m = torch.distributions.Bernoulli(probs=probs)
+        action = m.sample() # sample an action
+        log_pi = m.log_prob(action) # compute log probability of sampled action
+        return action.squeeze(0), log_pi.squeeze(0), -torch.log(probs).squeeze(0)
+
+    def baseline(self, x):
+        # Run the baseline network
+        # input is the concatenated hidden state and current timestep
+        # output is a scalar value that will be trained to approximate the average reward
+        b = self.baseline_linear(x.detach())
+        return b
+
+    def get_optimizer_and_scheduler(self):
+        # Initialize optimizer and scheduler for training EARLIEST
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+        return optimizer, scheduler
+
+    def batchify(self, X, y, batch_size):
+        # Split dataset into batches
+        batches = []
+        for i in range(len(X) // batch_size):
+            X_batch = X[(i*batch_size):(i*batch_size)+batch_size]
+            y_batch = y[(i*batch_size):(i*batch_size)+batch_size]
+            batches.append((X_batch, y_batch))
+        return batches
+
+    def shuffle_data(self, X, y):
+        # Randomly shuffle the dataset
+        shuffled_ix = np.random.choice(len(y), len(y), replace=False)
+        return X_train[shuffled_ix], y_train[shuffled_ix]
+
+    def fit(self, X_train, y_train):
+        # Train EARLIEST on the training dataset
+
+        # --- initialize optimizer and scheulder ---
+        optimizer, scheduler = self.get_optimizer_and_scheduler()
+
+        # --- train EARLIEST ---
+        # For each epoch:
+        #   1. Shuffle dataset
+        #   2. Split dataset into batches
+        #   3. Pass each batch into EARLIEST
+        #   4. Compute predictions for each element in the batch
+        #   5. Compute the loss
+        #   6. Update the weights of EARLIEST using the optimizer
+        for epoch in range(self.nepochs):
+            X_train, y_train = self.shuffle_data(X_train, y_train) # 1.
+            batches = self.batchify(X_train, y_train, self.batch_size) # 2.
+            epsilon = self.exponentials[epoch]
+            loss_sum = 0
+            for i, batch in enumerate(batches): # 3.
+                X, y = batch
+
+                # --- Forward pass through model ---
+                logits, halting_points = self.forward(X, epsilon) # 4.
+
+                # --- Compute gradients and update weights ---
+                optimizer.zero_grad()
+                loss = self.compute_loss(logits, y) # 5.
+                loss.backward()
+                loss_sum += loss.item()
+                optimizer.step() # 6.
+
+                if (i+1) % 10 == 0:
+                    print ('Epoch [{}/{}], Batch [{}/{}], Loss: {:.4f}'.format(epoch+1, args.nepochs, i+1, len(train_loader), loss.item()))
+
+            # training_loss.append(np.round(loss_sum/len(train_loader), 3))
+            final_loss = loss_sum/(i+1) # final_loss for the epoch is the average across all batches
+            scheduler.step() # Update the scheduler
+        
+    def predict_class_and_earliness(self, X_test):
+        # Given input time series, predict their class labels and their halting times assuming EARLIEST has already been trained
+        logits, pred_times = self.forward(X_test, epsilon=0)
+        preds = torch.max(torch.softmax(logits, dim=1), dim=1)[1]
+        return preds, pred_times
+
+    def init_hidden(self, bsz):
+        """Initialize hidden states"""
+        return (torch.zeros(self.nlayers, bsz, self.nhid),
+                torch.zeros(self.nlayers, bsz, self.nhid))
+        
+    def forward(self, X, epsilon):
+        """Compute halting points and predictions"""
+        X = torch.transpose(X, 0, 1)
+        T, B, V = X.shape # Assume input is of shape (TIMESTEPS x BATCH x VARIABLES)
+        baselines = [] # Predicted baselines
+        actions = [] # Which classes to halt at each step
+        log_pi = [] # Log probability of chosen actions
+        halt_probs = []
+        halt_points = -torch.ones((B, 1))
+        hidden = self.init_hidden(X.shape[1])
+        predictions = torch.zeros((B, self.nclasses), requires_grad=True)
+        all_preds = []
+
+        # --- for each timestep, select a set of actions ---
+        for t in range(T):
+            # run Base RNN on new data at step t
+            x = X[t].unsqueeze(0) # Chop off current timesteps
+            output, hidden = self.RNN(x, hidden)
+
+            # predict logits for all elements in the batch
+            logits = self.classify(output.squeeze())
+
+            # compute halting probability and sample an action
+            time = torch.tensor([t], dtype=torch.float, requires_grad=False).view(1, 1, 1).repeat(1, B, 1)
+            c_in = torch.cat((output, time), dim=2).detach()
+            a_t, p_t, w_t = self.controller(c_in, epsilon)
+
+            # If a_t == 1 and this class hasn't been halted, save its logits
+            predictions = torch.where((a_t == 1) & (predictions == 0), logits, predictions)
+
+            # If a_t == 1 and this class hasn't been halted, save the time
+            halt_points = torch.where((halt_points == -1) & (a_t == 1), time.squeeze(0), halt_points)
+
+            # compute baseline
+            b_t = self.baseline(torch.cat((output, time), dim=2).detach())
+
+            actions.append(a_t.squeeze())
+            baselines.append(b_t.squeeze())
+            log_pi.append(p_t)
+            halt_probs.append(w_t)
+            if (halt_points == -1).sum() == 0:  # If no negative values, every class has been halted
+                break
+
+        # If one element in the batch has not been halting, use its final prediction
+        logits = torch.where(predictions == 0.0, logits, predictions).squeeze()
+        halt_points = torch.where(halt_points == -1, time, halt_points).squeeze(0)
+        self.locations = np.array(halt_points + 1)
+        self.baselines = torch.stack(baselines).squeeze(1).transpose(0, 1)
+        self.log_pi = torch.stack(log_pi).squeeze(1).squeeze(2).transpose(0, 1)
+        self.halt_probs = torch.stack(halt_probs).transpose(0, 1).squeeze(2)
+        self.actions = torch.stack(actions).transpose(0, 1)
+
+        # --- Compute mask for where actions are updated ---
+        self.grad_mask = torch.zeros_like(self.actions)
+        for b in range(B):
+            self.grad_mask[b, :(1 + halt_points[b, 0]).long()] = 1
+        return logits.squeeze(), (1+halt_points)/(T)
+
+    def compute_loss(self, logits, y):
+        # --- compute reward ---
+        _, y_hat = torch.max(torch.softmax(logits, dim=1), dim=1)
+        self.r = (2*(y_hat.float().round() == y.float()).float()-1).detach().unsqueeze(1)
+        self.R = self.r * self.grad_mask
+
+        # --- rescale reward with baseline ---
+        b = self.grad_mask * self.baselines
+        self.adjusted_reward = self.R - b.detach()
+
+        # --- compute losses ---
+        MSE = torch.nn.MSELoss()
+        CE = torch.nn.CrossEntropyLoss()
+        self.loss_b = MSE(b, self.R) # Baseline should approximate mean reward
+        self.loss_r = (-self.log_pi*self.adjusted_reward).sum()/self.log_pi.shape[1] # RL loss
+        self.loss_c = CE(logits, y) # Classification loss
+        self.wait_penalty = self.halt_probs.sum(1).mean() # Penalize late predictions
+        self.lam = torch.tensor([self.lam], dtype=torch.float, requires_grad=False)
+        loss = self.loss_r + self.loss_b + self.loss_c + self.lam*(self.wait_penalty)
+        return loss
+
 
 class NonMyopicEarlyClassifier(ClassifierMixin, TimeSeriesBaseEstimator):
     """Early Classification modelling for time series using the model
